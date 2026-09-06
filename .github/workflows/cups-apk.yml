@@ -1,4 +1,4 @@
-name: Build CUPS for OpenWrt 25.12.2 x86_64 (混合 feed 修复版)
+name: Build CUPS for OpenWrt 25.12.2 x86_64
 
 on:
   push:
@@ -8,39 +8,32 @@ on:
   workflow_dispatch:
     inputs:
       openwrt_version:
-        description: 'OpenWrt SDK 版本号'
+        description: 'OpenWrt 版本号'
         required: true
         default: '25.12.2'
       target:
-        description: '目标平台 (target/subtarget)'
+        description: '目标平台'
         required: true
         default: 'x86/64'
       create_release:
-        description: '是否创建 GitHub Release'
+        description: '是否创建 Release'
         type: boolean
         default: true
 
-# 授予创建 Release 的权限
+# 授予 Release 权限
 permissions:
   contents: write
 
 env:
   OPENWRT_VERSION: ${{ github.event.inputs.openwrt_version || '25.12.2' }}
   TARGET: ${{ github.event.inputs.target || 'x86/64' }}
-  # Feed 1: OpenWrt 23.05 官方（含 cups, cups-filters, ghostscript）
-  FEED1_NAME: openwrt2305
-  FEED1_URL: https://github.com/openwrt/packages.git
-  FEED1_BRANCH: openwrt-23.05
-  # Feed 2: coolsnowwolf（含 gutenprint，作为补充）
-  FEED2_NAME: coolsnowwolf
-  FEED2_URL: https://github.com/coolsnowwolf/packages.git
 
 jobs:
   build:
     runs-on: ubuntu-22.04
     
     steps:
-      - name: 检出仓库
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: 安装编译依赖
@@ -87,103 +80,54 @@ jobs:
           tar -I zstd -xf sdk.tar.zst -C sdk --strip-components=1
           echo "SDK 解压完成"
 
-      # ============================================================
-      # 关键修复：配置双 feed（混合模式）
-      # ============================================================
-      - name: 配置双 feed（23.05官方 + coolsnowwolf补充）
+      - name: 添加包含 CUPS 的第三方 feed
         working-directory: sdk
         run: |
-          echo "=== 原始 feeds.conf.default ==="
+          # 备份原 feeds.conf
+          cp feeds.conf.default feeds.conf.default.bak
+          
+          # 添加 coolsnowwolf/packages feed（包含 cups、ghostscript、gutenprint）
+          # 该 feed 是 Lean OpenWrt 的 packages，维护了大量官方已移除的包
+          echo "src-git cupsfeed https://github.com/coolsnowwolf/packages.git" >> feeds.conf.default
+          
+          # 也可以使用 OpenWrt 23.05 旧版 packages feed（仍包含 cups）
+          # echo "src-git cupsfeed https://github.com/openwrt/packages.git;openwrt-23.05" >> feeds.conf.default
+          
+          echo "=== feeds.conf ==="
           cat feeds.conf.default
-          
-          echo ""
-          echo "=== 添加 Feed 1: OpenWrt 23.05 官方 ==="
-          echo "src-git ${FEED1_NAME} ${FEED1_URL};${FEED1_BRANCH}" >> feeds.conf.default
-          
-          echo "=== 添加 Feed 2: coolsnowwolf（补充 gutenprint）==="
-          echo "src-git ${FEED2_NAME} ${FEED2_URL}" >> feeds.conf.default
-          
-          echo ""
-          echo "=== 最终 feeds.conf.default ==="
-          cat feeds.conf.default
-          
-          echo ""
-          echo "=== Feed 说明 ==="
-          echo "${FEED1_NAME}: ${FEED1_URL} (${FEED1_BRANCH}) - 提供 cups, cups-filters, ghostscript"
-          echo "${FEED2_NAME}: ${FEED2_URL} - 提供 gutenprint（23.05官方源缺失）"
 
       - name: 更新 feeds
         working-directory: sdk
         run: |
-          echo "=== 更新所有 feeds ==="
-          ./scripts/feeds update -a 2>&1 | tail -30
+          ./scripts/feeds update -a
           
-          echo ""
-          echo "=== 检查各 feed 中的 CUPS 相关包 ==="
-          echo "--- Feed 1 (${FEED1_NAME}) ---"
-          ./scripts/feeds list -d 2>/dev/null | grep "^${FEED1_NAME}/" | grep -iE 'cups|ghostscript|gutenprint' || echo "  (无匹配)"
-          
-          echo "--- Feed 2 (${FEED2_NAME}) ---"
-          ./scripts/feeds list -d 2>/dev/null | grep "^${FEED2_NAME}/" | grep -iE 'cups|ghostscript|gutenprint' || echo "  (无匹配)"
-          
-          echo ""
-          echo "=== 所有可用的 cups 相关包 ==="
-          ./scripts/feeds list | grep -iE 'cups|ghostscript|gutenprint' || echo "未找到"
+          echo "=== 检查 cups 相关包是否可用 ==="
+          ./scripts/feeds list | grep -iE 'cups|ghostscript|gutenprint' || echo "未找到，继续尝试安装"
 
-      # ============================================================
-      # 智能安装：优先从 feed1 安装，缺失的从 feed2 安装
-      # ============================================================
-      - name: 智能安装 CUPS 相关包（自动回退）
+      - name: 安装 CUPS 相关包到编译树
         working-directory: sdk
         run: |
-          # 定义需要安装的包列表
-          PACKAGES="cups cups-filters ghostscript gutenprint"
+          # 安装 cups 及其依赖
+          ./scripts/feeds install -a -p cupsfeed
           
-          for pkg in $PACKAGES; do
-            echo ""
-            echo "=== 安装包: $pkg ==="
-            
-            # 尝试从 Feed 1 (23.05官方) 安装
-            if ./scripts/feeds list -d 2>/dev/null | grep -q "^${FEED1_NAME}/${pkg}"; then
-              echo "  → 从 ${FEED1_NAME} (23.05官方) 安装"
-              ./scripts/feeds install -p ${FEED1_NAME} $pkg 2>&1 | tail -5
-            # 尝试从 Feed 2 (coolsnowwolf) 安装
-            elif ./scripts/feeds list -d 2>/dev/null | grep -q "^${FEED2_NAME}/${pkg}"; then
-              echo "  → 从 ${FEED2_NAME} (coolsnowwolf) 安装"
-              ./scripts/feeds install -p ${FEED2_NAME} $pkg 2>&1 | tail -5
-            # 都没有，尝试默认安装
-            else
-              echo "  → 两个 feed 都没有，尝试默认安装"
-              ./scripts/feeds install $pkg 2>&1 | tail -5
-            fi
-          done
+          # 强制安装 cups 相关包
+          ./scripts/feeds install cups
+          ./scripts/feeds install cups-filters
+          ./scripts/feeds install ghostscript
+          ./scripts/feeds install gutenprint
           
-          echo ""
-          echo "=== 已安装的包（package/feeds/ 目录）==="
-          for feed in ${FEED1_NAME} ${FEED2_NAME}; do
-            echo "--- $feed ---"
-            ls package/feeds/$feed/ 2>/dev/null | grep -iE 'cups|ghostscript|gutenprint' || echo "  (无)"
-          done
-          
-          echo ""
-          echo "=== 各包的实际来源 ==="
-          for pkg in cups cups-filters ghostscript gutenprint; do
-            SRC=$(find package/feeds/ -maxdepth 2 -name "Makefile" -path "*/$pkg" 2>/dev/null | head -1)
-            if [ -n "$SRC" ]; then
-              echo "  $pkg → $SRC"
-            else
-              echo "  $pkg → 未找到!"
-            fi
-          done
+          echo "=== 验证包已安装 ==="
+          ls -la package/feeds/cupsfeed/ 2>/dev/null | grep -iE 'cups|ghostscript|gutenprint' || \
+          ls -la package/feeds/ | head -20
 
       - name: 配置编译选项
         working-directory: sdk
         run: |
+          # 生成默认配置
           make defconfig
           
-          # 启用所有 CUPS 相关包
-          PACKAGES="cups cups-filters ghostscript gutenprint libcups"
-          for pkg in $PACKAGES; do
+          # 启用 cups 相关包为模块（M）
+          for pkg in cups cups-filters ghostscript gutenprint; do
             if grep -q "CONFIG_PACKAGE_${pkg}=" .config; then
               sed -i "s/# CONFIG_PACKAGE_${pkg} is not set/CONFIG_PACKAGE_${pkg}=m/" .config
               sed -i "s/CONFIG_PACKAGE_${pkg}=y/CONFIG_PACKAGE_${pkg}=m/" .config
@@ -192,108 +136,68 @@ jobs:
             fi
           done
           
+          # 重新生成配置
           make defconfig
           
           echo "=== CUPS 相关配置 ==="
           grep -iE 'cups|ghostscript|gutenprint' .config
 
-      - name: 编译工具链
+      - name: 编译 CUPS 及依赖
         working-directory: sdk
         run: |
-          make toolchain/install -j$(nproc) 2>&1 | tail -10
-          echo "工具链编译完成"
+          # 先编译工具链（首次需要）
+          make toolchain/install -j$(nproc)
+          
+          # 编译 cups 及其所有依赖
+          echo "=== 开始编译 cups ==="
+          make package/feeds/cupsfeed/cups/compile V=s -j$(nproc) 2>&1 | tail -50
+          
+          echo "=== 开始编译 cups-filters ==="
+          make package/feeds/cupsfeed/cups-filters/compile V=s -j$(nproc) 2>&1 | tail -50
+          
+          echo "=== 开始编译 ghostscript ==="
+          make package/feeds/cupsfeed/ghostscript/compile V=s -j$(nproc) 2>&1 | tail -50
+          
+          echo "=== 开始编译 gutenprint ==="
+          make package/feeds/cupsfeed/gutenprint/compile V=s -j$(nproc) 2>&1 | tail -50
+          
+          echo "=== 编译完成 ==="
 
-      # ============================================================
-      # 编译各包（动态查找路径）
-      # ============================================================
-      - name: 编译 CUPS 核心
+      - name: 查找所有编译产物
         working-directory: sdk
         run: |
-          CUPS_DIR=$(find package/feeds/ -maxdepth 2 -name "Makefile" -path "*cups" ! -path "*cups-filters*" | head -1 | xargs dirname)
-          echo "CUPS 目录: $CUPS_DIR"
-          
-          if [ -z "$CUPS_DIR" ]; then
-            echo "::error::未找到 cups 包"
-            exit 1
-          fi
-          
-          echo "=== 编译 CUPS ==="
-          make $CUPS_DIR/compile V=s -j$(nproc) 2>&1 | tail -40
-          echo "CUPS 编译退出码: $?"
-
-      - name: 编译 cups-filters
-        working-directory: sdk
-        run: |
-          CF_DIR=$(find package/feeds/ -maxdepth 2 -name "Makefile" -path "*cups-filters*" | head -1 | xargs dirname)
-          echo "cups-filters 目录: $CF_DIR"
-          
-          if [ -z "$CF_DIR" ]; then
-            echo "::warning::未找到 cups-filters，跳过"
-            exit 0
-          fi
-          
-          echo "=== 编译 cups-filters ==="
-          make $CF_DIR/compile V=s -j$(nproc) 2>&1 | tail -40
-          echo "cups-filters 编译退出码: $?"
-
-      - name: 编译 ghostscript
-        working-directory: sdk
-        run: |
-          GS_DIR=$(find package/feeds/ -maxdepth 2 -name "Makefile" -path "*ghostscript*" | head -1 | xargs dirname)
-          echo "ghostscript 目录: $GS_DIR"
-          
-          if [ -z "$GS_DIR" ]; then
-            echo "::warning::未找到 ghostscript，跳过"
-            exit 0
-          fi
-          
-          echo "=== 编译 ghostscript（耗时较长）==="
-          make $GS_DIR/compile V=s -j$(nproc) 2>&1 | tail -40
-          echo "ghostscript 编译退出码: $?"
-
-      - name: 编译 gutenprint
-        working-directory: sdk
-        run: |
-          GP_DIR=$(find package/feeds/ -maxdepth 2 -name "Makefile" -path "*gutenprint*" | head -1 | xargs dirname)
-          echo "gutenprint 目录: $GP_DIR"
-          
-          if [ -z "$GP_DIR" ]; then
-            echo "::error::未找到 gutenprint 包"
-            echo "::error::请确认 coolsnowwolf feed 已正确添加"
-            exit 1
-          fi
-          
-          echo "=== 编译 gutenprint ==="
-          make $GP_DIR/compile V=s -j$(nproc) 2>&1 | tail -40
-          echo "gutenprint 编译退出码: $?"
-
-      - name: 查找编译产物
-        working-directory: sdk
-        run: |
-          echo "=== 所有 apk ==="
-          find bin/ -name "*.apk" -type f 2>/dev/null | sort
+          echo "=== 所有 apk 文件 ==="
+          find bin/ -name "*.apk" -type f 2>/dev/null
           
           echo ""
-          echo "=== CUPS 相关 ==="
-          find bin/ -iname "*cups*" -type f 2>/dev/null | sort
+          echo "=== CUPS 相关 apk ==="
+          find bin/ -iname "*cups*" -type f 2>/dev/null
           
           echo ""
-          echo "=== ghostscript 相关 ==="
-          find bin/ -iname "*ghostscript*" -o -iname "*libgs*" -type f 2>/dev/null | sort
+          echo "=== ghostscript 相关 apk ==="
+          find bin/ -iname "*ghostscript*" -o -iname "*gs*" -type f 2>/dev/null | head -20
           
           echo ""
-          echo "=== gutenprint 相关 ==="
-          find bin/ -iname "*gutenprint*" -type f 2>/dev/null | sort
+          echo "=== gutenprint 相关 apk ==="
+          find bin/ -iname "*gutenprint*" -type f 2>/dev/null
 
       - name: 收集编译产物
         id: collect
         run: |
           mkdir -p output
           
+          # 收集所有 cups 相关 apk
           find sdk/bin/ -iname "*cups*" -name "*.apk" -exec cp {} output/ \; 2>/dev/null
+          
+          # 收集 ghostscript
           find sdk/bin/ -iname "*ghostscript*" -name "*.apk" -exec cp {} output/ \; 2>/dev/null
-          find sdk/bin/ -iname "*libgs*" -name "*.apk" -exec cp {} output/ \; 2>/dev/null
+          
+          # 收集 gutenprint
           find sdk/bin/ -iname "*gutenprint*" -name "*.apk" -exec cp {} output/ \; 2>/dev/null
+          
+          # 收集依赖库（libcups 等）
+          find sdk/bin/ -iname "*libcups*" -name "*.apk" -exec cp {} output/ \; 2>/dev/null
+          find sdk/bin/ -iname "*libgs*" -name "*.apk" -exec cp {} output/ \; 2>/dev/null
           
           echo "=== 产物列表 ==="
           ls -lh output/
@@ -309,7 +213,7 @@ jobs:
       - name: 上传 Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cups-hybrid-feed-${{ env.OPENWRT_VERSION }}-x86_64
+          name: cups-openwrt-${{ env.OPENWRT_VERSION }}-x86_64
           path: output/
           retention-days: 30
 
@@ -317,50 +221,50 @@ jobs:
         if: ${{ github.event.inputs.create_release == 'true' || github.event_name == 'push' }}
         run: |
           cat > release.txt << EOF
-          ## CUPS for OpenWrt ${{ env.OPENWRT_VERSION }} (x86_64) — 混合 feed 版
+          ## CUPS for OpenWrt ${{ env.OPENWRT_VERSION }} (x86_64)
           
           ### 编译信息
           | 项目 | 值 |
           |------|-----|
           | OpenWrt 版本 | ${{ env.OPENWRT_VERSION }} |
           | 目标平台 | x86/64 |
+          | 架构 | x86_64 |
           | 包格式 | apk |
           | 产物数量 | ${{ steps.collect.outputs.apk_count }} 个 |
           
-          ### Feed 来源（混合模式）
-          | Feed | 地址 | 提供的包 |
-          |------|------|----------|
-          | OpenWrt 23.05 官方 | openwrt/packages.git;openwrt-23.05 | cups, cups-filters, ghostscript |
-          | coolsnowwolf | coolsnowwolf/packages.git | gutenprint（官方源缺失） |
-          
-          ### 为什么用混合 feed？
-          OpenWrt 23.05 官方 packages feed 中**没有 gutenprint 包**，
-          因此使用 coolsnowwolf feed 补充 gutenprint，其余包从官方 23.05 feed 获取。
-          
           ### 包含的软件包
-          - \`cups\` - CUPS 打印系统核心（IPP 服务端）
-          - \`libcups\` - CUPS 共享库
-          - \`cups-filters\` - CUPS 过滤器
-          - \`ghostscript\` - PostScript/PDF 渲染引擎
-          - \`gutenprint\` - 打印机驱动（含佳能 PIXMA iP1180）
+          - cups - CUPS 打印系统核心
+          - cups-filters - CUPS 过滤器
+          - ghostscript - PostScript/PDF 渲染引擎
+          - gutenprint - 打印机驱动集合（含佳能 PIXMA 系列）
+          - libcups - CUPS 库
           
           ### 安装方法
           \`\`\`bash
+          # 1. 上传所有 apk 到路由器
           scp *.apk root@192.168.1.1:/tmp/
+          
+          # 2. SSH 登录并安装
           ssh root@192.168.1.1
           cd /tmp
+          
+          # 按依赖顺序安装
           opkg install libcups*.apk
           opkg install ghostscript*.apk
           opkg install gutenprint*.apk
           opkg install cups-filters*.apk
           opkg install cups*.apk
-          /etc/init.d/cupsd enable
-          /etc/init.d/cupsd start
           \`\`\`
+          
+          ### 适用场景
+          - USB 打印机共享（Windows + Android 无线打印）
+          - Android 通过 IPP 协议打印（Mopria Print Service）
+          - Windows 通过 IPP 或 RAW 9100 打印
           
           > 自动编译于 GitHub Actions
           > 编译时间: $(date -u +"%Y-%m-%d %H:%M:%S UTC")
           EOF
+          
           cat release.txt
 
       - name: 发布到 GitHub Release
@@ -369,8 +273,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tag_name: cups-hybrid-feed-${{ env.OPENWRT_VERSION }}-x86_64
-          name: CUPS (混合 feed) for OpenWrt ${{ env.OPENWRT_VERSION }} (x86_64)
+          tag_name: cups-openwrt-${{ env.OPENWRT_VERSION }}-x86_64
+          name: CUPS for OpenWrt ${{ env.OPENWRT_VERSION }} (x86_64)
           body_path: release.txt
           files: output/*.apk
           draft: false
